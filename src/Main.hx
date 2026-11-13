@@ -7,7 +7,6 @@ import openfl.events.KeyboardEvent;
 import openfl.events.MouseEvent;
 import mods.api.Context;
 import mods.api.Mod;
-import mods.custom_settings_api.CustomSettingsApi;
 import uI.hud.starlingConverted.StarlingHud;
 import starling.textures.Texture;
 import starling.display.Image;
@@ -63,8 +62,24 @@ class Main extends Mod {
 	var lastStateMachineState:Dynamic = null;
 	var lastSyncTimestamp:Float = 0;
 
+	var nativeButtonsChoice:Dynamic = null;
+	var nativePromptChoice:Dynamic = null;
+	var nativeControllerStyleChoice:Dynamic = null;
+	var nativeKeyboardStyleChoice:Dynamic = null;
+
 	override public function init(context:Context):Void {
 		this.context = context;
+
+		loadDirectSettingsFromDisk();
+
+		var csaActive = false;
+		try {
+			csaActive = @:privateAccess modding.Host.alive("custom_settings_api");
+		} catch (e:Dynamic) {}
+
+		if (!csaActive) {
+			tryRegisterNativeApiSettings();
+		}
 	}
 
 	override public function ready(context:Context):Void {
@@ -192,6 +207,7 @@ class Main extends Mod {
 			} catch (e3:Dynamic) {}
 		}
 
+		saveDirectSettingsToDisk();
 		facade = null;
 	}
 
@@ -1490,49 +1506,192 @@ class Main extends Mod {
 		} catch (eFall:Dynamic) {}
 	}
 
+	function getCustomSettingsBridge():Dynamic {
+		try {
+			var b:Dynamic = @:privateAccess modding.Host.world.variables.get("customSettingsApi");
+			if (b != null) return b;
+		} catch (e:Dynamic) {}
+		try {
+			var cls:Dynamic = @:privateAccess modding.Host.world.compiled.get("mods.custom_settings_api.CustomSettingsApi");
+			if (cls != null) {
+				var b:Dynamic = Reflect.field(cls, "bridge");
+				if (b != null) return b;
+				return cls;
+			}
+		} catch (e2:Dynamic) {}
+		try {
+			var sc:Dynamic = @:privateAccess modding.Host.world.resolve("mods.custom_settings_api.CustomSettingsApi");
+			if (sc != null) {
+				if (Reflect.hasField(sc, "interp")) {
+					var interp:Dynamic = Reflect.field(sc, "interp");
+					if (interp != null && interp.locals != null && interp.locals.exists("bridge")) {
+						return interp.locals.get("bridge").r;
+					}
+				}
+				return sc;
+			}
+		} catch (e3:Dynamic) {}
+		return null;
+	}
+
+	function invokeBridge(bridge:Dynamic, method:String, args:Array<Dynamic>):Dynamic {
+		if (bridge == null) return null;
+		var fn:Dynamic = Reflect.field(bridge, method);
+		if (fn == null && Reflect.hasField(bridge, "interp")) {
+			try {
+				var interp:Dynamic = Reflect.field(bridge, "interp");
+				if (interp != null && interp.locals != null && interp.locals.exists(method)) {
+					fn = interp.locals.get(method).r;
+				}
+			} catch (e:Dynamic) {}
+		}
+		if (fn != null) {
+			return Reflect.callMethod(bridge, fn, args);
+		}
+		return null;
+	}
+
+	function loadDirectSettingsFromDisk():Void {
+		if (context == null) return;
+		try {
+			var path = context.data + "/settings.json";
+			if (sys.FileSystem.exists(path)) {
+				var content = sys.io.File.getContent(path);
+				var parsed:Dynamic = haxe.Json.parse(content);
+				if (parsed != null) {
+					var opts:Dynamic = (Reflect.hasField(parsed, "options") && Reflect.field(parsed, "options") != null) ? Reflect.field(parsed, "options") : parsed;
+
+					var bVal:Dynamic = Reflect.hasField(opts, "hud_buttons_used") ? Reflect.field(opts, "hud_buttons_used") : Reflect.field(parsed, "hud_buttons_used");
+					if (bVal != null && Std.string(bVal) != "") buttonsUsed = Std.string(bVal);
+
+					var pVal:Dynamic = Reflect.hasField(opts, "hud_prompt_mode") ? Reflect.field(opts, "hud_prompt_mode") : Reflect.field(parsed, "hud_prompt_mode");
+					if (pVal != null && Std.string(pVal) != "") {
+						var s = Std.string(pVal);
+						if (s == "default") promptMode = "auto";
+						else if (s == "kbm_dark" || s == "kbm_light" || s == "positional" || s == "arrows") {
+							keyboardStyle = (s == "kbm_light") ? "kbm_light" : "kbm_dark";
+							promptMode = "kbm";
+						} else promptMode = s;
+					}
+
+					var cVal:Dynamic = Reflect.hasField(opts, "hud_controller_style") ? Reflect.field(opts, "hud_controller_style") : Reflect.field(parsed, "hud_controller_style");
+					if (cVal != null && Std.string(cVal) != "") {
+						var s = Std.string(cVal);
+						if (s == "positional" || s == "arrows" || s == "kbm_dark" || s == "kbm_light") {
+							keyboardStyle = (s == "kbm_light") ? "kbm_light" : "kbm_dark";
+							controllerStyle = "auto";
+						} else if (s.indexOf("steam_") == 0 || s == "oculus" || s == "vive") {
+							controllerStyle = "auto";
+						} else controllerStyle = s;
+					}
+
+					var kVal:Dynamic = Reflect.hasField(opts, "hud_keyboard_style") ? Reflect.field(opts, "hud_keyboard_style") : Reflect.field(parsed, "hud_keyboard_style");
+					if (kVal != null && Std.string(kVal) != "") {
+						var s = Std.string(kVal);
+						if (s == "positional" || s == "arrows") s = "kbm_dark";
+						keyboardStyle = s;
+					}
+				}
+			}
+		} catch (e:Dynamic) {
+			if (context != null) context.log("Could not load direct settings.json: " + Std.string(e));
+		}
+	}
+
+	function saveDirectSettingsToDisk():Void {
+		if (context == null) return;
+		try {
+			var path = context.data + "/settings.json";
+			var existing:Dynamic = {};
+			var optsObj:Dynamic = {};
+			if (sys.FileSystem.exists(path)) {
+				try {
+					var parsed:Dynamic = haxe.Json.parse(sys.io.File.getContent(path));
+					if (parsed != null) {
+						for (f in Reflect.fields(parsed)) {
+							Reflect.setField(existing, f, Reflect.field(parsed, f));
+						}
+						if (Reflect.hasField(parsed, "options")) {
+							var sub = Reflect.field(parsed, "options");
+							if (sub != null) {
+								for (f in Reflect.fields(sub)) {
+									Reflect.setField(optsObj, f, Reflect.field(sub, f));
+								}
+							}
+						}
+					}
+				} catch (eParse:Dynamic) {}
+			}
+			Reflect.setField(existing, "hud_buttons_used", buttonsUsed);
+			Reflect.setField(optsObj, "hud_buttons_used", buttonsUsed);
+
+			Reflect.setField(existing, "hud_prompt_mode", promptMode);
+			Reflect.setField(optsObj, "hud_prompt_mode", promptMode);
+
+			Reflect.setField(existing, "hud_controller_style", controllerStyle);
+			Reflect.setField(optsObj, "hud_controller_style", controllerStyle);
+
+			Reflect.setField(existing, "hud_keyboard_style", keyboardStyle);
+			Reflect.setField(optsObj, "hud_keyboard_style", keyboardStyle);
+
+			Reflect.setField(existing, "options", optsObj);
+			if (!Reflect.hasField(existing, "keys")) {
+				Reflect.setField(existing, "keys", {});
+			}
+
+			sys.io.File.saveContent(path, haxe.Json.stringify(existing, null, "\t"));
+		} catch (e:Dynamic) {
+			if (context != null) context.log("Failed to save direct settings: " + Std.string(e));
+		}
+	}
+
 	function tryRegisterSettings():Bool {
 		if (settingsRegistered) return true;
 
-		// 1. Direct typed call to CustomSettingsApi (both mods in the same compilation world)
-		try {
-			CustomSettingsApi.addCategory("input_hud", "INPUT HUD", "hud_input_selector");
+		var bridge:Dynamic = getCustomSettingsBridge();
+		if (bridge == null) return tryRegisterNativeApiSettings();
 
-			CustomSettingsApi.addSimpleChoice(
+		try {
+			invokeBridge(bridge, "addCategory", ["input_hud", "INPUT HUD", "hud_input_selector"]);
+
+			invokeBridge(bridge, "addSimpleChoice", [
 				"input_hud",
 				"hud_buttons_used",
 				"BUTTONS USED",
 				"Selects which key binding from game controls to display on the HUD: Default (primary) or Alt (secondary).",
 				["default", "alt"],
 				["Default", "Alt"],
-				"default",
+				buttonsUsed,
 				function(val:Dynamic) {
 					var s = Std.string(val);
 					if (s != buttonsUsed) {
 						buttonsUsed = s;
+						saveDirectSettingsToDisk();
 						syncHUD(true);
 					}
 				}
-			);
+			]);
 
-			CustomSettingsApi.addSimpleChoice(
+			invokeBridge(bridge, "addSimpleChoice", [
 				"input_hud",
 				"hud_prompt_mode",
 				"BUTTON PROMPTS",
 				"HUD prompt style: Auto Detect (switches dynamically between controller and keyboard), Keyboard, or Controller.",
 				["auto", "kbm", "controller"],
 				["Auto Detect", "Keyboard", "Controller"],
-				"auto",
+				promptMode,
 				function(val:Dynamic) {
 					var s = Std.string(val);
 					if (s != promptMode) {
 						promptMode = s;
+						saveDirectSettingsToDisk();
 						applyGlyphPreference();
 						syncHUD(true);
 					}
 				}
-			);
+			]);
 
-			CustomSettingsApi.addSimpleChoice(
+			invokeBridge(bridge, "addSimpleChoice", [
 				"input_hud",
 				"hud_controller_style",
 				"CONTROLLER STYLE",
@@ -1575,39 +1734,41 @@ class Main extends Mod {
 					"Amazon Luna",
 					"Ouya"
 				],
-				"auto",
+				controllerStyle,
 				function(val:Dynamic) {
 					var s = Std.string(val);
 					if (s != controllerStyle) {
 						controllerStyle = s;
+						saveDirectSettingsToDisk();
 						applyGlyphPreference();
 						syncHUD(true);
 					}
 				}
-			);
+			]);
 
-			CustomSettingsApi.addSimpleChoice(
+			invokeBridge(bridge, "addSimpleChoice", [
 				"input_hud",
 				"hud_keyboard_style",
 				"KEYBOARD STYLE",
 				"Visual style used when keyboard prompts are active: Text (labels), Dark Keys, or Light Keys.",
 				["text", "kbm_dark", "kbm_light"],
 				["Text", "Dark Keys", "Light Keys"],
-				"text",
+				keyboardStyle,
 				function(val:Dynamic) {
 					var s = Std.string(val);
 					if (s != keyboardStyle) {
 						keyboardStyle = s;
+						saveDirectSettingsToDisk();
 						applyGlyphPreference();
 						syncHUD(true);
 					}
 				}
-			);
+			]);
 
-			var storedButtons = CustomSettingsApi.getString("hud_buttons_used", "default");
+			var storedButtons = invokeBridge(bridge, "getString", ["hud_buttons_used", buttonsUsed]);
 			if (storedButtons != null && storedButtons != "") buttonsUsed = storedButtons;
 
-			var storedMode = CustomSettingsApi.getString("hud_prompt_mode", "auto");
+			var storedMode = invokeBridge(bridge, "getString", ["hud_prompt_mode", promptMode]);
 			if (storedMode != null && storedMode != "") {
 				if (storedMode == "default") {
 					promptMode = "auto";
@@ -1619,7 +1780,7 @@ class Main extends Mod {
 				}
 			}
 
-			var storedStyle = CustomSettingsApi.getString("hud_controller_style", "auto");
+			var storedStyle = invokeBridge(bridge, "getString", ["hud_controller_style", controllerStyle]);
 			if (storedStyle != null && storedStyle != "") {
 				if (storedStyle == "positional" || storedStyle == "arrows" || storedStyle == "kbm_dark" || storedStyle == "kbm_light") {
 					keyboardStyle = storedStyle == "kbm_light" ? "kbm_light" : "kbm_dark";
@@ -1631,191 +1792,136 @@ class Main extends Mod {
 				}
 			}
 
-			var storedKbm = CustomSettingsApi.getString("hud_keyboard_style", "text");
+			var storedKbm = invokeBridge(bridge, "getString", ["hud_keyboard_style", keyboardStyle]);
 			if (storedKbm != null && storedKbm != "") {
 				if (storedKbm == "positional" || storedKbm == "arrows") storedKbm = "kbm_dark";
 				keyboardStyle = storedKbm;
 			}
 
+			saveDirectSettingsToDisk();
 			settingsRegistered = true;
 			if (context != null) {
-				context.log("HUD Input Selector registered settings directly with CustomSettingsApi.");
+				context.log("HUD Input Selector registered settings via CustomSettingsApi bridge.");
 			}
 			applyGlyphPreference();
 			syncHUD(true);
 			return true;
 		} catch (e:Dynamic) {
-			if (context != null) {
-				context.log("Direct CustomSettingsApi call threw (" + Std.string(e) + "), attempting bridge fallback...");
-			}
+			if (context != null) context.log("Error registering via CustomSettingsApi bridge: " + Std.string(e));
+			return tryRegisterNativeApiSettings();
 		}
+	}
 
-		// 2. Dynamic bridge fallback through facade.customSettingsApi
-		var bridge:Dynamic = Reflect.field(facade, "customSettingsApi");
-		if (bridge == null) bridge = Reflect.field(facade, "settingsExtender");
-		if (bridge == null) return false;
+	function tryRegisterNativeApiSettings():Bool {
+		if (context == null || settingsRegistered) return false;
+		var settingsObj:Dynamic = context.settings;
+		if (settingsObj == null) return false;
 
 		try {
-			var addCat = Reflect.field(bridge, "addCategory");
-			if (addCat != null) {
-				Reflect.callMethod(bridge, addCat, ["input_hud", "INPUT HUD", "hud_input_selector"]);
+			var cButtons:Dynamic = settingsObj.choice(
+				"hud_buttons_used",
+				"Buttons Used",
+				"Selects which key binding from game controls to display on the HUD: Default (primary) or Alt (secondary).",
+				[
+					{value: "default", label: "Default"},
+					{value: "alt", label: "Alt"}
+				],
+				buttonsUsed
+			);
+			if (cButtons != null && cButtons.value != null && cButtons.value != "") buttonsUsed = cButtons.value;
+			if (cButtons != null) {
+				cButtons.onChange(function(val:String) {
+					buttonsUsed = val;
+					saveDirectSettingsToDisk();
+					syncHUD(true);
+				});
 			}
 
-			var addChoice = Reflect.field(bridge, "addSimpleChoice");
-			if (addChoice != null) {
-				Reflect.callMethod(bridge, addChoice, [
-					"input_hud",
-					"hud_buttons_used",
-					"BUTTONS USED",
-					"Selects which key binding from game controls to display on the HUD: Default (primary) or Alt (secondary).",
-					["default", "alt"],
-					["Default", "Alt"],
-					"default",
-					function(val:Dynamic) {
-						var s = Std.string(val);
-						if (s != buttonsUsed) {
-							buttonsUsed = s;
-							syncHUD(true);
-						}
-					}
-				]);
-
-				Reflect.callMethod(bridge, addChoice, [
-					"input_hud",
-					"hud_prompt_mode",
-					"BUTTON PROMPTS",
-					"HUD prompt style: Auto Detect (switches dynamically between controller and keyboard), Keyboard, or Controller.",
-					["auto", "kbm", "controller"],
-					["Auto Detect", "Keyboard", "Controller"],
-					"auto",
-					function(val:Dynamic) {
-						var s = Std.string(val);
-						if (s != promptMode) {
-							promptMode = s;
-							applyGlyphPreference();
-							syncHUD(true);
-						}
-					}
-				]);
-
-				Reflect.callMethod(bridge, addChoice, [
-					"input_hud",
-					"hud_controller_style",
-					"CONTROLLER STYLE",
-					"Icon style used when controller prompts are displayed on the HUD (DualSense, Xbox, Nintendo Switch, etc.).",
-					[
-						"auto",
-						"ps5",
-						"ps4",
-						"xbox",
-						"xbox360",
-						"switch",
-						"steamdeck",
-						"ps3",
-						"xboxone",
-						"steam",
-						"wiiu",
-						"wii",
-						"psvita",
-						"psmove",
-						"googlestadia",
-						"amazonluna",
-						"ouya"
-					],
-					[
-						"Auto Detect",
-						"DualSense",
-						"DualShock 4",
-						"Xbox Series/One",
-						"Xbox 360",
-						"Nintendo Switch",
-						"Steam Deck",
-						"DualShock 3",
-						"Xbox One",
-						"Steam Controller",
-						"Wii U",
-						"Wii",
-						"PS Vita",
-						"PS Move",
-						"Google Stadia",
-						"Amazon Luna",
-						"Ouya"
-					],
-					"auto",
-					function(val:Dynamic) {
-						var s = Std.string(val);
-						if (s != controllerStyle) {
-							controllerStyle = s;
-							applyGlyphPreference();
-							syncHUD(true);
-						}
-					}
-				]);
-
-				Reflect.callMethod(bridge, addChoice, [
-					"input_hud",
-					"hud_keyboard_style",
-					"KEYBOARD STYLE",
-					"Visual style used when keyboard prompts are active: Text (labels), Dark Keys, or Light Keys.",
-					["text", "kbm_dark", "kbm_light"],
-					["Text", "Dark Keys", "Light Keys"],
-					"text",
-					function(val:Dynamic) {
-						var s = Std.string(val);
-						if (s != keyboardStyle) {
-							keyboardStyle = s;
-							applyGlyphPreference();
-							syncHUD(true);
-						}
-					}
-				]);
+			var cMode:Dynamic = settingsObj.choice(
+				"hud_prompt_mode",
+				"Button Prompts",
+				"HUD prompt style: Auto Detect (switches dynamically between controller and keyboard), Keyboard, or Controller.",
+				[
+					{value: "auto", label: "Auto Detect"},
+					{value: "kbm", label: "Keyboard"},
+					{value: "controller", label: "Controller"}
+				],
+				promptMode
+			);
+			if (cMode != null && cMode.value != null && cMode.value != "") promptMode = cMode.value;
+			if (cMode != null) {
+				cMode.onChange(function(val:String) {
+					promptMode = val;
+					saveDirectSettingsToDisk();
+					applyGlyphPreference();
+					syncHUD(true);
+				});
 			}
 
-			var getStr = Reflect.field(bridge, "getString");
-			if (getStr != null) {
-				var storedButtons = Reflect.callMethod(bridge, getStr, ["hud_buttons_used", "default"]);
-				if (storedButtons != null && storedButtons != "") buttonsUsed = storedButtons;
-
-				var storedMode = Reflect.callMethod(bridge, getStr, ["hud_prompt_mode", "auto"]);
-				if (storedMode != null && storedMode != "") {
-					if (storedMode == "default") {
-						promptMode = "auto";
-					} else if (storedMode == "kbm_dark" || storedMode == "kbm_light" || storedMode == "positional" || storedMode == "arrows") {
-						keyboardStyle = storedMode == "kbm_light" ? "kbm_light" : "kbm_dark";
-						promptMode = "kbm";
-					} else {
-						promptMode = storedMode;
-					}
-				}
-
-				var storedStyle = Reflect.callMethod(bridge, getStr, ["hud_controller_style", "auto"]);
-				if (storedStyle != null && storedStyle != "") {
-					if (storedStyle == "positional" || storedStyle == "arrows" || storedStyle == "kbm_dark" || storedStyle == "kbm_light") {
-						keyboardStyle = storedStyle == "kbm_light" ? "kbm_light" : "kbm_dark";
-						controllerStyle = "auto";
-					} else if (storedStyle.indexOf("steam_") == 0 || storedStyle == "oculus" || storedStyle == "vive") {
-						controllerStyle = "auto";
-					} else {
-						controllerStyle = storedStyle;
-					}
-				}
-
-				var storedKbm = Reflect.callMethod(bridge, getStr, ["hud_keyboard_style", "text"]);
-				if (storedKbm != null && storedKbm != "") {
-					if (storedKbm == "positional" || storedKbm == "arrows") storedKbm = "kbm_dark";
-					keyboardStyle = storedKbm;
-				}
+			var cCtrl:Dynamic = settingsObj.choice(
+				"hud_controller_style",
+				"Controller Style",
+				"Icon style used when controller prompts are displayed on the HUD (DualSense, Xbox, Nintendo Switch, etc.).",
+				[
+					{value: "auto", label: "Auto Detect"},
+					{value: "ps5", label: "DualSense"},
+					{value: "ps4", label: "DualShock 4"},
+					{value: "xbox", label: "Xbox Series/One"},
+					{value: "xbox360", label: "Xbox 360"},
+					{value: "switch", label: "Nintendo Switch"},
+					{value: "steamdeck", label: "Steam Deck"},
+					{value: "ps3", label: "DualShock 3"},
+					{value: "xboxone", label: "Xbox One"},
+					{value: "steam", label: "Steam Controller"},
+					{value: "wiiu", label: "Wii U"},
+					{value: "wii", label: "Wii"},
+					{value: "psvita", label: "PS Vita"},
+					{value: "psmove", label: "PS Move"},
+					{value: "googlestadia", label: "Google Stadia"},
+					{value: "amazonluna", label: "Amazon Luna"},
+					{value: "ouya", label: "Ouya"}
+				],
+				controllerStyle
+			);
+			if (cCtrl != null && cCtrl.value != null && cCtrl.value != "") controllerStyle = cCtrl.value;
+			if (cCtrl != null) {
+				cCtrl.onChange(function(val:String) {
+					controllerStyle = val;
+					saveDirectSettingsToDisk();
+					applyGlyphPreference();
+					syncHUD(true);
+				});
 			}
 
+			var cKbm:Dynamic = settingsObj.choice(
+				"hud_keyboard_style",
+				"Keyboard Style",
+				"Visual style used when keyboard prompts are active: Text (labels), Dark Keys, or Light Keys.",
+				[
+					{value: "text", label: "Text"},
+					{value: "kbm_dark", label: "Dark Keys"},
+					{value: "kbm_light", label: "Light Keys"}
+				],
+				keyboardStyle
+			);
+			if (cKbm != null && cKbm.value != null && cKbm.value != "") keyboardStyle = cKbm.value;
+			if (cKbm != null) {
+				cKbm.onChange(function(val:String) {
+					keyboardStyle = val;
+					saveDirectSettingsToDisk();
+					applyGlyphPreference();
+					syncHUD(true);
+				});
+			}
+
+			saveDirectSettingsToDisk();
 			settingsRegistered = true;
-			if (context != null) {
-				context.log("HUD Input Selector registered settings via facade bridge.");
-			}
+			context.log("HUD Input Selector registered settings natively via Mod API 1.3.0.");
 			applyGlyphPreference();
 			syncHUD(true);
 			return true;
-		} catch (e:Dynamic) {
-			if (context != null) context.log("Error registering via bridge: " + Std.string(e));
+		} catch (eNative:Dynamic) {
+			if (context != null) context.log("Error registering via Mod API 1.3: " + Std.string(eNative));
 			return false;
 		}
 	}
