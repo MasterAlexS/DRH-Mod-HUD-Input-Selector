@@ -4,14 +4,14 @@ A mod for [Dungeon Rampage Haxe](https://github.com/Tutez64/Dungeon-Rampage-Haxe
 
 <!-- drh:show -->
 ### Settings & Organization
-- **Standalone**: Works out of the box with native settings on Mod API 1.3.0+.
+- **Standalone**: Works out of the box with native settings on Mod API 1.4.0+.
 - **Recommended**: **[Custom Settings API](https://github.com/MasterAlexS/DRH-Mod-Custom-Settings-API)** — provides a dedicated, beautifully organized **INPUT HUD** menu tab and category in the settings.
 
 ---
 
 ### Features
 
-Take control of how button prompts are displayed on your HUD:
+Take control of how button prompts are displayed across the entire in-game HUD:
 
 1. **BUTTONS USED**:
    - **Default**: Displays the primary key bindings configured in the game controls.
@@ -31,7 +31,13 @@ Take control of how button prompts are displayed on your HUD:
    - **Dark Keys**: Graphical keycap prompts on a dark background.
    - **Light Keys**: Graphical keycap prompts on a light background.
 
-### Seamless Settings Integration
-- Works seamlessly either standalone (via native Mod API 1.3.0+ settings) or through **Custom Settings API** for a dedicated, neatly organized **INPUT HUD** tab.
+5. **FULL HUD PROMPT COVERAGE**:
+   - **Action Bar & Potions**: All skill slots, health potion, and hero abilities display styled keycaps or controller glyphs.
+   - **Top-Right Buttons**: Displays ESC and O keycaps for Keyboard (Dark/Light keys), or Menu (Start/Options) and View (Back/Select/Touchpad) glyphs for Gamepads on Close [X] and Settings Gear buttons.
+   - **Chat Log**: Displays the controller D-Pad Left prompt icon on the chat `LOG` button.
+   - **Ultimate / Buster**: Formats prompts with `"PRESS [GLYPH]"` for Controller and Dark/Light keycaps, and `"PRESS B"` in text mode.
+
+### Floor Transitions & Persistence
+- HUD button prompts persist seamlessly between dungeon floors, gate transitions, and respawns without reverting or disappearing.
 - Settings are saved automatically per mod across game restarts.
 <!-- /drh:show -->
