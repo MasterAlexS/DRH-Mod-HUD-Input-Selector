@@ -48,7 +48,6 @@ class Main extends Mod {
 	var keyboardStyle:String = "kbm_dark"; // "kbm_dark", "kbm_light", "text"
 
 	var lastUsedDevice:String = "kbm"; // "kbm" or "controller"
-	var customSettingsRegistered:Bool = false;
 	var nativeSettingsRegistered:Bool = false;
 	var initializedState:Bool = false;
 	var isSyncingHUD:Bool = false;
@@ -63,6 +62,24 @@ class Main extends Mod {
 	var lastEnforcedGeneration:Int = -1;
 	var lastStateMachineState:Dynamic = null;
 	var lastSyncTimestamp:Float = 0;
+
+	// Optimization & Caching fields (Zero-alloc & throttle)
+	static var ANALOG_MOVE_ACTIONS:Array<String> = ["game_movement", "move", "movement"];
+	static var DIGITAL_BUTTON_FIELDS:Array<String> = ["mPressedDigitalButtons", "mHeldDigitalButtons", "pressedDigitalButtons", "heldDigitalButtons"];
+	static var BUSTER_TEXT_PATHS:Array<String> = [
+		"UI_buster_active.buster_activated.up.db_pressbutton_text",
+		"UI_buster_active.buster_activated.over.mc.db_pressbutton_text",
+		"UI_buster_glow.buster_text.buster_text_label.db_pressbutton_text"
+	];
+
+	var cachedDeviceKey:String = "";
+	var deviceKeyDirty:Bool = true;
+	var lastCachedPromptState:String = "";
+	var lastGamepadPollTime:Int = 0;
+	var lastBusterHasGlyph:Null<Bool> = null;
+	var lastCachedHud:Dynamic = null;
+	var isCachedHudStarling:Bool = false;
+	var isCachedHudFlash:Bool = false;
 
 	var nativeButtonsChoice:Dynamic = null;
 	var nativePromptChoice:Dynamic = null;
@@ -123,25 +140,8 @@ class Main extends Mod {
 		// Ensure custom LocalSteamInputGlyphs and aliases are in place
 		ensureCustomLocalGlyphs();
 
-		// 1. Always register settings natively with Mod API (ensures options exist in game catalog)
+		// Register settings natively with Mod API in the official MODS menu
 		tryRegisterNativeApiSettings();
-
-		// 2. Explicitly register 'input_hud' category with CustomSettingsApi if available
-		try {
-			var cls:Dynamic = Type.resolveClass("mods.custom_settings_api.CustomSettingsApi");
-			if (cls != null) {
-				var fnAddCat = Reflect.field(cls, "addCategory");
-				if (fnAddCat != null) {
-					Reflect.callMethod(cls, fnAddCat, ["input_hud", "INPUT HUD", "hud_input_selector"]);
-				}
-			}
-		} catch (eCat:Dynamic) {}
-		try {
-			var bridge:Dynamic = getCustomSettingsBridge();
-			if (bridge != null) {
-				invokeBridge(bridge, "addCategory", ["input_hud", "INPUT HUD", "hud_input_selector"]);
-			}
-		} catch (eBridge:Dynamic) {}
 
 		// Listen for floor, hero, and town lifecycle events from mod API
 		try {
@@ -167,7 +167,13 @@ class Main extends Mod {
 		lastEnforcedDevice = "";
 		lastEnforcedView = null;
 		initializedState = false;
-		syncHUD(true);
+		if (facade != null) {
+			var hud:Dynamic = Reflect.field(facade, "hud");
+			if (hud == null) hud = Reflect.field(facade, "mHud");
+			if (isHudReady(hud)) {
+				syncHUD(true);
+			}
+		}
 	}
 
 	override public function dispose():Void {
@@ -229,8 +235,10 @@ class Main extends Mod {
 			// Ensure custom LocalSteamInputGlyphs is attached to steamInputManager
 			ensureCustomLocalGlyphs();
 
-			// Poll gamepad inputs and sync device in auto mode
-			pollGamepad();
+			// Poll gamepad inputs and sync device in auto mode only (5 FPS throttled, 200ms)
+			if (promptMode == "auto") {
+				pollGamepad();
+			}
 
 			// Enforce prompt state if game or screen transition changed it
 			enforceHUDState();
@@ -238,7 +246,7 @@ class Main extends Mod {
 	}
 
 	static inline function getTimestamp():Float {
-		return Date.now().getTime();
+		return openfl.Lib.getTimer();
 	}
 
 	function onControllerAction(e:Dynamic = null):Void {
@@ -255,7 +263,7 @@ class Main extends Mod {
 		if (sim == null) return false;
 		try {
 			// 1. Direct analog movement check on steamInputManager
-			for (actName in ["game_movement", "move", "movement"]) {
+			for (actName in ANALOG_MOVE_ACTIONS) {
 				try {
 					var moveVec:Dynamic = Reflect.callMethod(sim, Reflect.field(sim, "getAnalogAction"), [actName]);
 					if (moveVec != null) {
@@ -277,7 +285,7 @@ class Main extends Mod {
 
 					// Check digital buttons pressed this frame or held down
 					try {
-						for (fieldName in ["mPressedDigitalButtons", "mHeldDigitalButtons", "pressedDigitalButtons", "heldDigitalButtons"]) {
+						for (fieldName in DIGITAL_BUTTON_FIELDS) {
 							var dict:Dynamic = Reflect.field(c, fieldName);
 							if (dict != null) {
 								var keys:Array<Dynamic> = Dictionaries.keys(dict);
@@ -294,7 +302,7 @@ class Main extends Mod {
 						if (analogs == null) analogs = Reflect.field(c, "analogInputs");
 						if (analogs == null) analogs = Reflect.field(c, "mAnalogInputs");
 						if (analogs != null) {
-							for (actName in ["game_movement", "move", "movement"]) {
+							for (actName in ANALOG_MOVE_ACTIONS) {
 								var vec:Dynamic = Dictionaries.get(analogs, actName);
 								if (vec != null) {
 									var vx:Float = Reflect.field(vec, "x") != null ? Reflect.field(vec, "x") : 0.0;
@@ -404,14 +412,17 @@ class Main extends Mod {
 	}
 
 	function pollGamepad():Void {
-		if (promptMode != "auto") return;
-		if (facade == null) return;
+		if (promptMode != "auto" || facade == null) return;
+
+		var now:Int = openfl.Lib.getTimer();
+		if (now - lastGamepadPollTime < 200) return; // 5 FPS (200ms)
+		lastGamepadPollTime = now;
 
 		try {
 			// Check direct controller activity only (do not use mCursorHidden as DRH leaves it true until mouse moves)
 			var controllerActive = isAnyControllerActive();
 			if (controllerActive) {
-				lastControllerTime = getTimestamp();
+				lastControllerTime = now;
 				handleInputDevice("controller");
 			}
 		} catch (e:Dynamic) {}
@@ -420,6 +431,7 @@ class Main extends Mod {
 	function handleInputDevice(device:String):Void {
 		if (lastUsedDevice == device) return;
 		lastUsedDevice = device;
+		deviceKeyDirty = true;
 		if (promptMode == "auto") {
 			syncHUD(false);
 		}
@@ -436,7 +448,11 @@ class Main extends Mod {
 
 	function syncHUD(force:Bool = false):Void {
 		if (facade == null || isSyncingHUD) return;
-		var now = Date.now().getTime();
+		var hud:Dynamic = Reflect.field(facade, "hud");
+		if (hud == null) hud = Reflect.field(facade, "mHud");
+		if (!isHudReady(hud)) return;
+
+		var now = getTimestamp();
 		if (!force && initializedState && (now - lastSyncTimestamp < 250)) return;
 		isSyncingHUD = true;
 		try {
@@ -1000,12 +1016,7 @@ class Main extends Mod {
 					}
 				} catch (eL:Dynamic) {}
 			}
-			var paths:Array<String> = [
-				"UI_buster_active.buster_activated.up.db_pressbutton_text",
-				"UI_buster_active.buster_activated.over.mc.db_pressbutton_text",
-				"UI_buster_glow.buster_text.buster_text_label.db_pressbutton_text"
-			];
-			for (p in paths) {
+			for (p in BUSTER_TEXT_PATHS) {
 				try {
 					var nd:Dynamic = null;
 					var view:Dynamic = Reflect.field(sHud, "mView");
@@ -1033,11 +1044,40 @@ class Main extends Mod {
 		return false;
 	}
 
+	function checkHudType(hud:Dynamic):Void {
+		if (hud == lastCachedHud) return;
+		lastCachedHud = hud;
+		isCachedHudStarling = false;
+		isCachedHudFlash = false;
+		if (hud != null) {
+			try {
+				var cls = Type.getClass(hud);
+				if (cls != null) {
+					var name = Type.getClassName(cls);
+					if (name == "uI.hud.starlingConverted.StarlingHud") {
+						isCachedHudStarling = true;
+					} else if (name == "uI.hud.UIHud") {
+						isCachedHudFlash = true;
+					}
+				}
+			} catch (e:Dynamic) {}
+		}
+	}
+
+	function getDeviceKey(state:String):String {
+		if (deviceKeyDirty || state != lastCachedPromptState) {
+			cachedDeviceKey = buttonsUsed + "_" + promptMode + "_" + controllerStyle + "_" + keyboardStyle + "_" + state;
+			lastCachedPromptState = state;
+			deviceKeyDirty = false;
+		}
+		return cachedDeviceKey;
+	}
+
 	function isHudReady(hud:Dynamic):Bool {
 		if (hud == null) return false;
 		try {
-			var hudName:String = Type.getClassName(Type.getClass(hud));
-			if (hudName == "uI.hud.starlingConverted.StarlingHud") {
+			checkHudType(hud);
+			if (isCachedHudStarling) {
 				var sHud:Dynamic = hud;
 				if (Reflect.field(sHud, "mDestroyed") == true) return false;
 				var view:Dynamic = Reflect.field(sHud, "mView");
@@ -1061,7 +1101,7 @@ class Main extends Mod {
 				var hero:Dynamic = Reflect.field(sHud, "mHeroOwner");
 				if (hero == null) return false;
 				return true;
-			} else if (hudName == "uI.hud.UIHud") {
+			} else if (isCachedHudFlash) {
 				return true;
 			}
 		} catch (e:Dynamic) {}
@@ -1083,10 +1123,10 @@ class Main extends Mod {
 			if (hud == null) return;
 
 			var state = getDesiredPromptState();
-			var deviceKey = buttonsUsed + "_" + promptMode + "_" + controllerStyle + "_" + keyboardStyle + "_" + state;
+			var deviceKey = getDeviceKey(state);
 
-			var hudName:String = Type.getClassName(Type.getClass(hud));
-			if (hudName == "uI.hud.starlingConverted.StarlingHud") {
+			checkHudType(hud);
+			if (isCachedHudStarling) {
 				var sHud:Dynamic = hud;
 				killStarlingGlyphTask(sHud);
 				var view:Dynamic = Reflect.field(sHud, "mView");
@@ -1134,14 +1174,20 @@ class Main extends Mod {
 					lastEnforcedDevice = deviceKey;
 					lastEnforcedView = view;
 					lastSyncTimestamp = getTimestamp();
+					var busterHasGlyph = (state == "controller" || keyboardStyle != "text");
+					lastBusterHasGlyph = busterHasGlyph;
+					updateBusterPrompt(sHud, busterHasGlyph);
 					syncHUD(true);
 					return;
 				}
 
-				// Keep Buster prompt text in sync
+				// Keep Buster prompt text in sync only when state toggles
 				var busterHasGlyph = (state == "controller" || keyboardStyle != "text");
-				updateBusterPrompt(sHud, busterHasGlyph);
-			} else if (hudName == "uI.hud.UIHud") {
+				if (busterHasGlyph != lastBusterHasGlyph) {
+					lastBusterHasGlyph = busterHasGlyph;
+					updateBusterPrompt(sHud, busterHasGlyph);
+				}
+			} else if (isCachedHudFlash) {
 				if (hud != lastEnforcedHud || deviceKey != lastEnforcedDevice) {
 					if (!isHudReady(hud)) return;
 					lastEnforcedHud = hud;
@@ -1805,220 +1851,6 @@ class Main extends Mod {
 		} catch (eFall:Dynamic) {}
 	}
 
-	function getCustomSettingsBridge():Dynamic {
-		try {
-			if (facade != null) {
-				var bF:Dynamic = Reflect.field(facade, "customSettingsApi");
-				if (bF != null && Reflect.field(bF, "invoke") != null) return bF;
-			}
-
-			var openflStage:Dynamic = (context != null && context.overlay != null && context.overlay.stage != null)
-				? context.overlay.stage
-				: (facade != null ? Reflect.field(facade, "stageRef") : null);
-			if (openflStage != null) {
-				try {
-					var holder:Dynamic = Reflect.callMethod(openflStage, Reflect.field(openflStage, "getChildByName"), ["__customSettingsApiBridgeHolder__"]);
-					if (holder != null) {
-						var bH:Dynamic = Reflect.field(holder, "bridge");
-						if (bH != null && Reflect.field(bH, "invoke") != null) return bH;
-					}
-				} catch (eHolder:Dynamic) {}
-				var bS:Dynamic = Reflect.field(openflStage, "customSettingsApiBridge");
-				if (bS != null && Reflect.field(bS, "invoke") != null) return bS;
-			}
-
-			if (context != null && context.overlay != null) {
-				var bO:Dynamic = Reflect.field(context.overlay, "customSettingsApiBridge");
-				if (bO != null && Reflect.field(bO, "invoke") != null) return bO;
-			}
-
-			var cls:Dynamic = Type.resolveClass("mods.custom_settings_api.CustomSettingsApi");
-			if (cls != null) {
-				var bC:Dynamic = Reflect.field(cls, "bridge");
-				if (bC != null && Reflect.field(bC, "invoke") != null) return bC;
-				try {
-					var fn = Reflect.field(cls, "getBridge");
-					if (fn != null) {
-						var res = Reflect.callMethod(cls, fn, []);
-						if (res != null && Reflect.field(res, "invoke") != null) return res;
-					}
-				} catch (eG:Dynamic) {}
-			}
-		} catch (e:Dynamic) {}
-		return null;
-	}
-
-	function invokeBridge(bridge:Dynamic, method:String, args:Array<Dynamic>):Dynamic {
-		if (bridge == null) return null;
-		try {
-			var invFn:Dynamic = Reflect.field(bridge, "invoke");
-			if (invFn != null) {
-				return Reflect.callMethod(bridge, invFn, [method, args]);
-			}
-			var fn:Dynamic = Reflect.field(bridge, method);
-			if (fn != null) {
-				return Reflect.callMethod(bridge, fn, args);
-			}
-		} catch (e:Dynamic) {
-			if (context != null) context.log("invokeBridge error on " + method + ": " + Std.string(e));
-		}
-		return null;
-	}
-
-	function tryRegisterSettings():Bool {
-		if (customSettingsRegistered) return true;
-
-		var bridge:Dynamic = getCustomSettingsBridge();
-		if (bridge == null) return false;
-
-		try {
-			var okCat = invokeBridge(bridge, "addCategory", ["input_hud", "INPUT HUD", "hud_input_selector"]);
-			if (okCat != true) {
-				return false;
-			}
-
-			invokeBridge(bridge, "addSimpleChoice", [
-				"input_hud",
-				"hud_buttons_used",
-				"BUTTONS USED",
-				"Selects which key binding from game controls to display on the HUD: Default (primary) or Alt (secondary).",
-				["default", "alt"],
-				["Default", "Alt"],
-				buttonsUsed,
-				function(val:Dynamic) {
-					var s = Std.string(val);
-					if (s != buttonsUsed) {
-						buttonsUsed = s;
-						if (nativeButtonsChoice != null) {
-							try { nativeButtonsChoice.value = s; } catch (e:Dynamic) {}
-						}
-						syncHUD(true);
-					}
-				}
-			]);
-
-			invokeBridge(bridge, "addSimpleChoice", [
-				"input_hud",
-				"hud_prompt_mode",
-				"BUTTON PROMPTS",
-				"HUD prompt style: Auto Detect (switches dynamically between controller and keyboard), Keyboard, or Controller.",
-				["auto", "kbm", "controller"],
-				["Auto Detect", "Keyboard", "Controller"],
-				promptMode,
-				function(val:Dynamic) {
-					var s = Std.string(val);
-					if (s != promptMode) {
-						promptMode = s;
-						if (nativePromptChoice != null) {
-							try { nativePromptChoice.value = s; } catch (e:Dynamic) {}
-						}
-						applyGlyphPreference();
-						syncHUD(true);
-					}
-				}
-			]);
-
-			invokeBridge(bridge, "addSimpleChoice", [
-				"input_hud",
-				"hud_controller_style",
-				"CONTROLLER STYLE",
-				"Icon style used when controller prompts are displayed on the HUD (DualSense, Xbox, Nintendo Switch, etc.).",
-				[
-					"auto",
-					"ps5",
-					"ps4",
-					"xbox",
-					"xbox360",
-					"switch",
-					"steamdeck",
-					"ps3",
-					"xboxone",
-					"steam",
-					"wiiu",
-					"wii",
-					"psvita",
-					"psmove",
-					"googlestadia",
-					"amazonluna",
-					"ouya"
-				],
-				[
-					"Auto Detect",
-					"DualSense",
-					"DualShock 4",
-					"Xbox Series/One",
-					"Xbox 360",
-					"Nintendo Switch",
-					"Steam Deck",
-					"DualShock 3",
-					"Xbox One",
-					"Steam Controller",
-					"Wii U",
-					"Wii",
-					"PS Vita",
-					"PS Move",
-					"Google Stadia",
-					"Amazon Luna",
-					"Ouya"
-				],
-				controllerStyle,
-				function(val:Dynamic) {
-					var s = Std.string(val);
-					if (s != controllerStyle) {
-						controllerStyle = s;
-						if (nativeControllerStyleChoice != null) {
-							try { nativeControllerStyleChoice.value = s; } catch (e:Dynamic) {}
-						}
-						applyGlyphPreference();
-						syncHUD(true);
-					}
-				}
-			]);
-
-			invokeBridge(bridge, "addSimpleChoice", [
-				"input_hud",
-				"hud_keyboard_style",
-				"KEYBOARD STYLE",
-				"Visual style used when keyboard prompts are active: Text (labels), Dark Keys, or Light Keys.",
-				["text", "kbm_dark", "kbm_light"],
-				["Text", "Dark Keys", "Light Keys"],
-				keyboardStyle,
-				function(val:Dynamic) {
-					var s = Std.string(val);
-					if (s != keyboardStyle) {
-						keyboardStyle = s;
-						if (nativeKeyboardStyleChoice != null) {
-							try { nativeKeyboardStyleChoice.value = s; } catch (e:Dynamic) {}
-						}
-						applyGlyphPreference();
-						syncHUD(true);
-					}
-				}
-			]);
-
-			// Synchronize active values from CustomSettingsApi if persisted on disk
-			var bVal:Dynamic = invokeBridge(bridge, "get", ["hud_buttons_used"]);
-			if (bVal != null && Std.string(bVal) != "") buttonsUsed = Std.string(bVal);
-			var pVal:Dynamic = invokeBridge(bridge, "get", ["hud_prompt_mode"]);
-			if (pVal != null && Std.string(pVal) != "") promptMode = Std.string(pVal);
-			var cVal:Dynamic = invokeBridge(bridge, "get", ["hud_controller_style"]);
-			if (cVal != null && Std.string(cVal) != "") controllerStyle = Std.string(cVal);
-			var kVal:Dynamic = invokeBridge(bridge, "get", ["hud_keyboard_style"]);
-			if (kVal != null && Std.string(kVal) != "") keyboardStyle = Std.string(kVal);
-
-			customSettingsRegistered = true;
-			if (context != null) {
-				context.log("HUD Input Selector registered settings via CustomSettingsApi bridge.");
-			}
-			applyGlyphPreference();
-			syncHUD(true);
-			return true;
-		} catch (e:Dynamic) {
-			if (context != null) context.log("Error registering via CustomSettingsApi bridge: " + Std.string(e));
-			return false;
-		}
-	}
-
 	function tryRegisterNativeApiSettings():Bool {
 		if (context == null || nativeSettingsRegistered) return false;
 		var settingsObj:Dynamic = context.settings;
@@ -2039,6 +1871,7 @@ class Main extends Mod {
 			if (nativeButtonsChoice != null) {
 				nativeButtonsChoice.onChange(function(val:String) {
 					buttonsUsed = val;
+					deviceKeyDirty = true;
 					syncHUD(true);
 				});
 			}
@@ -2058,6 +1891,7 @@ class Main extends Mod {
 			if (nativePromptChoice != null) {
 				nativePromptChoice.onChange(function(val:String) {
 					promptMode = val;
+					deviceKeyDirty = true;
 					applyGlyphPreference();
 					syncHUD(true);
 				});
@@ -2092,6 +1926,7 @@ class Main extends Mod {
 			if (nativeControllerStyleChoice != null) {
 				nativeControllerStyleChoice.onChange(function(val:String) {
 					controllerStyle = val;
+					deviceKeyDirty = true;
 					applyGlyphPreference();
 					syncHUD(true);
 				});
@@ -2112,6 +1947,7 @@ class Main extends Mod {
 			if (nativeKeyboardStyleChoice != null) {
 				nativeKeyboardStyleChoice.onChange(function(val:String) {
 					keyboardStyle = val;
+					deviceKeyDirty = true;
 					applyGlyphPreference();
 					syncHUD(true);
 				});

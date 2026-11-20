@@ -3,12 +3,6 @@
 A mod for [Dungeon Rampage Haxe](https://github.com/Tutez64/Dungeon-Rampage-Haxe) that gives you full control over in-game HUD button prompts, key bindings display, and controller icon styles.
 
 <!-- drh:show -->
-### Settings & Organization
-- **Standalone**: Works out of the box with native settings on Mod API 1.4.0+.
-- **Recommended**: **[Custom Settings API](https://github.com/MasterAlexS/DRH-Mod-Custom-Settings-API)** — provides a dedicated, beautifully organized **INPUT HUD** menu tab and category in the settings.
-
----
-
 ### Features
 
 Take control of how button prompts are displayed across the entire in-game HUD:
