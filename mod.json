@@ -2,10 +2,10 @@
   "id": "hud_input_selector",
   "name": "HUD Input Selector",
   "description": "Customize HUD button prompts: dynamic Auto Detect, Keyboard, or Controller, with custom gamepad and keycap styles.",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "author": "MasterAlexS",
-  "api": "1.4.0",
+  "api": "1.6.0",
   "entry": "Main",
   "uses": ["extends"],
-  "drh": "17-18"
+  "drh": "17-19"
 }
